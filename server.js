@@ -1,7 +1,9 @@
-// server.js - COMPLETE FEEDBACK SYSTEM
+// server.js - COMPLETE FEEDBACK SYSTEM WITH FIXED WEBSOCKET
 const express = require('express');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
+const http = require('http'); // Add this
+const WebSocket = require('ws'); // Add this
 const app = express();
 
 // Middleware
@@ -85,6 +87,19 @@ function initializeDatabase() {
             FOREIGN KEY (user_id) REFERENCES users (id)
         )`);
 
+        // Notifications table - ADD THIS FOR REAL-TIME NOTIFICATIONS
+        db.run(`CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            type TEXT DEFAULT 'info',
+            is_read BOOLEAN DEFAULT 0,
+            conditions TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )`);
+
         console.log('✅ Database tables created/verified');
         
         // Insert sample data
@@ -131,6 +146,23 @@ function insertSampleData() {
             sampleFeedback.forEach(feedback => {
                 db.run(`INSERT INTO feedback (name, email, subject, message, wants_response) 
                         VALUES (?, ?, ?, ?, ?)`, feedback);
+            });
+        }
+    });
+
+    // Insert sample notifications
+    db.get("SELECT COUNT(*) as count FROM notifications", (err, row) => {
+        if (row.count === 0) {
+            console.log('🔔 Inserting sample notifications...');
+            const sampleNotifications = [
+                [1, 'Payment Reminder', 'Your trimester fees are due in 7 days', 'warning', 0, '{"due_soon": true}'],
+                [1, 'Welcome to DeakinPay', 'Get started with our secure payment system', 'info', 0, '{"new_user": true}'],
+                [2, 'System Update', 'New features added to the payment portal', 'info', 0, '{"all_users": true}']
+            ];
+
+            sampleNotifications.forEach(notification => {
+                db.run(`INSERT INTO notifications (user_id, title, message, type, is_read, conditions) 
+                        VALUES (?, ?, ?, ?, ?, ?)`, notification);
             });
         }
     });
@@ -264,11 +296,23 @@ function getCompleteUserData(userId) {
                         }
                         const transactions = transRows;
 
-                        resolve({
-                            ...user,
-                            units,
-                            fees,
-                            transactions
+                        // Get user notifications
+                        db.all(`SELECT id, title, message, type, is_read, created_at 
+                                FROM notifications WHERE user_id = ? OR conditions LIKE '%"all_users": true%' 
+                                ORDER BY created_at DESC LIMIT 10`, [userId], (err, notificationRows) => {
+                            if (err) {
+                                reject(err);
+                                return;
+                            }
+                            const notifications = notificationRows;
+
+                            resolve({
+                                ...user,
+                                units,
+                                fees,
+                                transactions,
+                                notifications
+                            });
                         });
                     });
                 });
@@ -350,6 +394,65 @@ app.delete('/api/feedback/:id', (req, res) => {
     });
 });
 
+// NOTIFICATION APIs - NEW REAL-TIME FEATURES
+app.get('/api/user/:userId/notifications', (req, res) => {
+    const { userId } = req.params;
+    
+    db.all(`SELECT id, title, message, type, is_read, created_at 
+            FROM notifications 
+            WHERE user_id = ? OR conditions LIKE '%"all_users": true%'
+            ORDER BY created_at DESC`, [userId], (err, rows) => {
+        if (err) {
+            console.error('Error fetching notifications:', err);
+            return res.status(500).json({ success: false, error: 'Database error' });
+        }
+        res.json(rows);
+    });
+});
+
+app.put('/api/notifications/:id/read', (req, res) => {
+    const { id } = req.params;
+    
+    db.run(`UPDATE notifications SET is_read = 1 WHERE id = ?`, [id], function(err) {
+        if (err) {
+            console.error('Error updating notification:', err);
+            return res.status(500).json({ success: false, error: 'Database error' });
+        }
+        res.json({ success: true, changes: this.changes });
+    });
+});
+
+// Create notification with conditions
+app.post('/api/notifications', (req, res) => {
+    const { userId, title, message, type, conditions } = req.body;
+    
+    db.run(`INSERT INTO notifications (user_id, title, message, type, conditions) 
+            VALUES (?, ?, ?, ?, ?)`, 
+            [userId, title, message, type, JSON.stringify(conditions)], 
+            function(err) {
+        if (err) {
+            console.error('Error creating notification:', err);
+            return res.status(500).json({ success: false, error: 'Database error' });
+        }
+        
+        // Send real-time notification to connected clients
+        if (wss) {
+            sendUserNotification(userId, {
+                type: 'new_notification',
+                notification: {
+                    id: this.lastID,
+                    title,
+                    message,
+                    type,
+                    created_at: new Date().toISOString()
+                }
+            });
+        }
+        
+        res.json({ success: true, id: this.lastID });
+    });
+});
+
 // User data APIs
 app.get('/api/user/:userId/transactions', (req, res) => {
     const { userId } = req.params;
@@ -392,11 +495,66 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+// Create HTTP server first
+const server = http.createServer(app);
+
+// THEN initialize WebSocket server
+let wss = null;
+try {
+    wss = new WebSocket.Server({ server });
+    console.log('🔔 WebSocket server initialized for real-time notifications');
+    
+    // Store connected clients
+    const clients = new Map();
+    
+    wss.on('connection', (ws, req) => {
+        console.log('🔌 New WebSocket connection');
+        
+        ws.on('message', (message) => {
+            try {
+                const data = JSON.parse(message);
+                
+                if (data.type === 'authenticate' && data.userId) {
+                    // Store user connection
+                    clients.set(data.userId, ws);
+                    ws.userId = data.userId;
+                    console.log(`✅ User ${data.userId} connected to WebSocket`);
+                }
+            } catch (error) {
+                console.error('Error parsing WebSocket message:', error);
+            }
+        });
+        
+        ws.on('close', () => {
+            if (ws.userId) {
+                clients.delete(ws.userId);
+                console.log(`❌ User ${ws.userId} disconnected from WebSocket`);
+            }
+        });
+    });
+    
+    // Function to send notifications to specific users
+    function sendUserNotification(userId, message) {
+        const client = clients.get(userId.toString());
+        if (client && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(message));
+            console.log(`📨 Sent notification to user ${userId}`);
+        }
+    }
+    
+    // Make function available globally
+    global.sendUserNotification = sendUserNotification;
+    
+} catch (error) {
+    console.log('⚠️ WebSocket server not available (might be in test environment)');
+}
+
 const PORT = 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 DeakinPay Server with FEEDBACK SYSTEM running at: http://localhost:${PORT}`);
+server.listen(PORT, () => {
+    console.log(`🚀 DeakinPay Server with REAL-TIME NOTIFICATIONS running at: http://localhost:${PORT}`);
     console.log(`📊 Using SQLite database: deakinpay.db`);
     console.log(`💬 Feedback system: ACTIVE`);
+    console.log(`🔔 Real-time notifications: ${wss ? 'ACTIVE' : 'DISABLED'}`);
     console.log(`📧 Test Accounts:`);
     console.log(`   s224967779@deakin.edu.au / Deakin2025`);
     console.log(`   demo@deakin.edu.au / password123`);
@@ -414,4 +572,3 @@ process.on('SIGINT', () => {
         process.exit(0);
     });
 });
-

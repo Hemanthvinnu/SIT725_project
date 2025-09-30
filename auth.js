@@ -142,3 +142,77 @@ function showPaymentPage() {
         alert('Error loading payment page. Check console.');
     }
 }
+
+function validateLogin(email, password) {
+    console.log('🔐 Validating login for:', email);
+    
+    // Basic email validation
+    if (!email || !email.includes('@')) {
+        console.error('❌ Invalid email format');
+        return { success: false, message: 'Please enter a valid email address' };
+    }
+    
+    // Basic password validation
+    if (!password || password.length < 6) {
+        console.error('❌ Password too short');
+        return { success: false, message: 'Password must be at least 6 characters' };
+    }
+    
+    // Check if it's a Deakin email
+    if (!email.endsWith('@deakin.edu.au')) {
+        console.error('❌ Not a Deakin email');
+        return { success: false, message: 'Please use your Deakin email address' };
+    }
+    
+    console.log('✅ Login validation passed');
+    return { success: true, message: 'Validation passed' };
+}
+
+function togglePassword() {
+    console.log('👁️ Toggling password visibility');
+    
+    const passwordInput = document.getElementById('password');
+    const toggleIcon = document.querySelector('.password-toggle i');
+    
+    if (!passwordInput) {
+        console.error('❌ Password input not found');
+        return;
+    }
+    
+    // Toggle password visibility
+    if (passwordInput.type === 'password') {
+        passwordInput.type = 'text';
+        if (toggleIcon) {
+            toggleIcon.className = 'fas fa-eye-slash';
+        }
+        console.log('✅ Password shown');
+    } else {
+        passwordInput.type = 'password';
+        if (toggleIcon) {
+            toggleIcon.className = 'fas fa-eye';
+        }
+        console.log('✅ Password hidden');
+    }
+}
+
+function logout() {
+    console.log('🚪 Logging out user');
+    
+    // Clear localStorage
+    localStorage.removeItem('deakinpay_loggedIn');
+    localStorage.removeItem('deakinpay_userData');
+    localStorage.removeItem('deakinpay_userEmail');
+    
+    // Show login page, hide payment page
+    const loginPage = document.getElementById('loginPage');
+    const paymentPage = document.getElementById('paymentPage');
+    
+    if (loginPage) loginPage.style.display = 'flex';
+    if (paymentPage) paymentPage.style.display = 'none';
+    
+    // Clear form fields
+    const loginForm = document.getElementById('loginForm');
+    if (loginForm) loginForm.reset();
+    
+    console.log('✅ User logged out successfully');
+}
